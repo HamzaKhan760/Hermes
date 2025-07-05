@@ -8,3 +8,5 @@ class OllamaLocal:
         {"role": "user", "content": prompt}
         ])
         return response['message']['content']
+
+#This file is no longer needed
