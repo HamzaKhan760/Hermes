@@ -4,6 +4,7 @@ import psycopg2
 import os
 from dotenv import load_dotenv
 from typing import TypedDict
+import re
 
 # ------------------ Database Setup ------------------
 
@@ -114,7 +115,19 @@ class AgentController:
 
             if query.strip().lower().startswith("select"):
                 rows = cur.fetchall()
-                result = "\n".join(str(row) for row in rows)
+                if rows:
+                    # Get column names for better formatting
+                    column_names = [desc[0] for desc in cur.description]
+                    
+                    # Format as a readable table
+                    result = f"Query Results:\n"
+                    result += " | ".join(column_names) + "\n"
+                    result += "-" * (len(" | ".join(column_names))) + "\n"
+                    
+                    for row in rows:
+                        result += " | ".join(str(val) if val is not None else "NULL" for val in row) + "\n"
+                else:
+                    result = "No results found."
             else:
                 conn.commit()
                 result = "Query executed successfully."
@@ -125,6 +138,36 @@ class AgentController:
 
         except Exception as e:
             return f"Error executing SQL: {e}"
+
+    def extract_sql_from_response(self, response: str) -> str:
+        """Extract SQL query from LLM response, handling markdown code blocks"""
+        
+        # First try to find Action Input pattern
+        if "Action Input:" in response:
+            start = response.find("Action Input:") + len("Action Input:")
+            query_section = response[start:].strip()
+        else:
+            query_section = response.strip()
+        
+        # Remove markdown code blocks if present
+        # Handle ```sql ... ``` pattern
+        sql_block_pattern = r'```(?:sql)?\s*(.*?)\s*```'
+        sql_match = re.search(sql_block_pattern, query_section, re.DOTALL | re.IGNORECASE)
+        
+        if sql_match:
+            return sql_match.group(1).strip()
+        
+        # If no code blocks found, clean up the query section
+        # Remove common prefixes and clean whitespace
+        lines = query_section.split('\n')
+        clean_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith('Action:') and not line.startswith('Thought:'):
+                clean_lines.append(line)
+        
+        return '\n'.join(clean_lines).strip()
 
     # -------- LangGraph Steps --------
 
@@ -142,10 +185,11 @@ class AgentController:
 
         prompt = (
             f"{state['schema_context']}\n\n"
-            "When deciding to use a tool, format your response strictly as:\n"
-            "Action: [ToolName]\n"
-            "Action Input: [Your input for the tool, SQL query or otherwise]\n"
-            "Do NOT wrap the input inside parentheses or quotes on the Action line.\n\n"
+            "You are a SQL expert. Based on the database schema above, write a SQL query to answer the user's question.\n"
+            "Respond with ONLY the SQL query, no explanations or markdown formatting.\n"
+            "If you must use formatting, use this pattern:\n"
+            "Action: SQLExecuter\n"
+            "Action Input: YOUR_SQL_QUERY_HERE\n\n"
             f"User request: {state['user_prompt']}"
         )
         llm_output = self.llm.invoke(prompt)
@@ -155,11 +199,14 @@ class AgentController:
     def tool_step(self, state: AgentState) -> AgentState:
         llm_response = state["llm_response"]
 
-        if "Action: SQLExecuter" in llm_response:
-            start = llm_response.find("Action Input:") + len("Action Input:")
-            query = llm_response[start:].strip()
-            result = self.run_sql(query)
-            state["final_output"] = f"SQL Result:\n{result}"
+        if "Action: SQLExecuter" in llm_response or "SELECT" in llm_response.upper():
+            query = self.extract_sql_from_response(llm_response)
+            
+            if query:
+                result = self.run_sql(query)
+                state["final_output"] = result
+            else:
+                state["final_output"] = "Could not extract SQL query from response."
         else:
             state["final_output"] = llm_response
 
