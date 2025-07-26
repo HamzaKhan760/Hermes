@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
 import psycopg2
 import os
 from dotenv import load_dotenv
@@ -29,7 +29,7 @@ class AgentState(TypedDict):
 
 class AgentController:
     def __init__(self, use_cached_schema: bool = True):
-        self.llm = Ollama(model="mistral")
+        self.llm = OllamaLLM(model="mistral")
         self.schema_context = None
 
         if use_cached_schema:
@@ -116,16 +116,13 @@ class AgentController:
             if query.strip().lower().startswith("select"):
                 rows = cur.fetchall()
                 if rows:
-                    # Get column names for better formatting
-                    column_names = [desc[0] for desc in cur.description]
-                    
-                    # Format as a readable table
-                    result = f"Query Results:\n"
-                    result += " | ".join(column_names) + "\n"
-                    result += "-" * (len(" | ".join(column_names))) + "\n"
-                    
-                    for row in rows:
-                        result += " | ".join(str(val) if val is not None else "NULL" for val in row) + "\n"
+                    # Try to detect if this is a 2-column "name + value" result
+                    if len(rows[0]) == 2 and all(isinstance(val, (str, int, float)) for val in rows[0]):
+                        result = "\n".join(
+                            f"{i+1}. {row[0]} - {row[1]} units" for i, row in enumerate(rows)
+                        )
+                    else:
+                        result = "\n".join(str(row) for row in rows)
                 else:
                     result = "No results found."
             else:
