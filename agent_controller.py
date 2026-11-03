@@ -4,6 +4,7 @@ import psycopg2
 import os
 from dotenv import load_dotenv
 from typing import TypedDict
+from decimal import Decimal
 import re
 
 # ------------------ Database Setup ------------------
@@ -101,7 +102,25 @@ class AgentController:
         except Exception as e:
             return f"Error fetching schema: {e}"
 
+    def validate_read_only(self, query: str) -> str | None:
+        """Return an error message if the query isn't a single read statement."""
+        statement = query.strip().rstrip(";").strip()
+
+        if not statement.lower().startswith(("select", "with")):
+            return "Only read-only queries (SELECT or WITH) are allowed."
+
+        # A second statement could end the read-only transaction set in run_sql
+        if ";" in statement:
+            return "Only a single SQL statement is allowed."
+
+        return None
+
     def run_sql(self, query: str) -> str:
+        validation_error = self.validate_read_only(query)
+        if validation_error:
+            return f"Query rejected: {validation_error}"
+
+        conn = None
         try:
             conn = psycopg2.connect(
                 host=DB_HOST,
@@ -110,31 +129,28 @@ class AgentController:
                 password=DB_PASSWORD,
                 port=DB_PORT
             )
+            # PostgreSQL rejects writes, including inside a WITH clause
+            conn.set_session(readonly=True)
             cur = conn.cursor()
             cur.execute(query)
 
-            if query.strip().lower().startswith("select"):
-                rows = cur.fetchall()
-                if rows:
-                    # Try to detect if this is a 2-column "name + value" result
-                    if len(rows[0]) == 2 and all(isinstance(val, (str, int, float)) for val in rows[0]):
-                        result = "\n".join(
-                            f"{i+1}. {row[0]} - {row[1]} units" for i, row in enumerate(rows)
-                        )
-                    else:
-                        result = "\n".join(str(row) for row in rows)
-                else:
-                    result = "No results found."
-            else:
-                conn.commit()
-                result = "Query executed successfully."
+            rows = cur.fetchall()
+            if not rows:
+                return "No results found."
 
-            cur.close()
-            conn.close()
-            return result
+            # Try to detect if this is a 2-column "name + value" result
+            if len(rows[0]) == 2 and all(isinstance(val, (str, int, float, Decimal)) for val in rows[0]):
+                return "\n".join(
+                    f"{i+1}. {row[0]} - {row[1]}" for i, row in enumerate(rows)
+                )
+            return "\n".join(str(row) for row in rows)
 
         except Exception as e:
             return f"Error executing SQL: {e}"
+
+        finally:
+            if conn:
+                conn.close()
 
     def extract_sql_from_response(self, response: str) -> str:
         """Extract SQL query from LLM response, handling markdown code blocks"""
@@ -194,6 +210,10 @@ class AgentController:
         return state
 
     def tool_step(self, state: AgentState) -> AgentState:
+        # An earlier step already failed, so there is no LLM response to process
+        if "final_output" in state:
+            return state
+
         llm_response = state["llm_response"]
 
         if "Action: SQLExecuter" in llm_response or "SELECT" in llm_response.upper():
